@@ -460,4 +460,13 @@ static inline void construct_attr_by_post_op(
   }
 }
 
+enum class ScalingType : std::uint8_t {
+  TensorWise,
+  RowWise,
+  BlockWise1x32,
+  BlockWise1x128,
+  // TODO: BlockWise1x16,
+  // TODO: BlockWise128x128,
+};
+
 } // namespace at::native::onednn

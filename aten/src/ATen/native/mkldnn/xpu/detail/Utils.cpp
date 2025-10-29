@@ -78,6 +78,12 @@ dnnl::memory::data_type get_onednn_dtype(
       return dnnl::memory::data_type::f32;
     case at::ScalarType::BFloat16:
       return dnnl::memory::data_type::bf16;
+    case at::ScalarType::Float8_e4m3fn:
+      return dnnl::memory::data_type::f8_e4m3;
+    case at::ScalarType::Float8_e5m2:
+      return dnnl::memory::data_type::f8_e5m2;
+    case at::ScalarType::Float4_e2m1fn_x2:
+      return dnnl::memory::data_type::f4_e2m1;
     default:
       if (!allow_undef) {
         TORCH_CHECK(

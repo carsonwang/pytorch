@@ -1,5 +1,6 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/WrapDimUtilsMulti.h>
+#include <ATen/ceil_div.h>
 #include <ATen/native/Resize.h>
 #include <ATen/native/mkldnn/xpu/detail/oneDNN.h>
 #include <torch/library.h>
@@ -18,6 +19,95 @@
 #endif
 
 namespace at::native {
+namespace {
+using at::native::onednn::ScalingType;
+
+bool is_tensorwise_scaling(const at::Tensor& t, const at::Tensor& scale) {
+  return isFloat8Type(t.scalar_type()) && scale.scalar_type() == kFloat && scale.numel() == 1;
+}
+
+bool is_rowwise_scaling(const at::Tensor& t, const at::Tensor& scale) {
+  return (isFloat8Type(t.scalar_type()) && scale.scalar_type() == kFloat && scale.dim() == 2
+      && scale.size(0) == t.size(0) && scale.size(1) == 1 && scale.is_contiguous());
+}
+
+// TODO: 1x16 blocks for packed nvfp4+ data and fp8_e5m3fn scales
+// bool is_blockwise_1x16_scaling(const at::Tensor& t, const at::Tensor& scale) {
+//   return (t.scalar_type() == ScalarType::Float4_e2m1fn_x2
+//       && scale.scalar_type() == at::kFloat8_e5m3fn
+//       && scale.numel() == t.size(0) * ceil_div<int64_t>(t.size(1) * 2, 16)
+//       && scale.is_contiguous());
+// }
+
+bool check_size_stride(const at::Tensor& scale, int dim, int size, int stride) {
+  // For Blockwise1x128 and Blockwise128x128,
+  // when the scale tensor has a dimension of size 1, the stride is effectively
+  // "meaningless", i.e. PyTorch decides to use a stride of 1. Thus, the regular
+  // stride check fails. Here, we relax the stride check when the effective
+  // stride is 1.
+
+  return (
+      scale.size(dim) == size && (size <= 1 || scale.stride(dim) == stride));
+}
+
+// 1x32 blocks for microscaled fp8/fp4 data and fp8_e8m0fnu scales
+bool is_blockwise_1x32_scaling(const at::Tensor& t, const at::Tensor& scale) {
+  bool is_fp8_path = (isFloat8Type(t.scalar_type()) && scale.scalar_type() == at::kFloat8_e8m0fnu
+      && scale.numel() == t.size(0) * ceil_div<int64_t>(t.size(1), 32));
+  bool is_packed_fp4_path = (t.scalar_type() == ScalarType::Float4_e2m1fn_x2 && scale.scalar_type() == at::kFloat8_e8m0fnu
+      && scale.numel() == t.size(0) * ceil_div<int64_t>(t.size(1) * 2, 32));
+  return (is_fp8_path || is_packed_fp4_path);
+}
+
+bool is_blockwise_1x128_scaling(const at::Tensor& t, const at::Tensor& scale) {
+  return (
+      isFloat8Type(t.scalar_type()) && scale.scalar_type() == kFloat &&
+      scale.dim() == 2 && check_size_stride(scale, 0, t.size(0), 1) &&
+      check_size_stride(
+          scale, 1, ceil_div<int64_t>(t.size(1), 128), t.size(0)));
+}
+
+bool is_desired_scaling(const at::Tensor& t, const at::Tensor& scale, ScalingType desired_scaling) {
+  switch (desired_scaling) {
+    case ScalingType::TensorWise:
+      return is_tensorwise_scaling(t, scale);
+    case ScalingType::RowWise:
+      return is_rowwise_scaling(t, scale);
+    case ScalingType::BlockWise1x32:
+      return is_blockwise_1x32_scaling(t, scale);
+    case ScalingType::BlockWise1x128:
+      return is_blockwise_1x128_scaling(t, scale);
+    default:
+      TORCH_CHECK(false);
+      return false;
+  }
+}
+
+std::pair<ScalingType, ScalingType> get_joint_scaling(
+    std::initializer_list<std::pair<ScalingType, ScalingType>> options,
+    const at::Tensor& a, const at::Tensor& b,
+    const at::Tensor& scale_a, const at::Tensor& scale_b) {
+  for (auto [lhs, rhs] : options) {
+    if (is_desired_scaling(a, scale_a, lhs) &&
+        is_desired_scaling(b.t(), scale_b.t(), rhs)) {
+      return {lhs, rhs};
+    }
+  }
+  TORCH_CHECK(
+    false,
+    "Invalid scaling configuration.\n"
+    "- For TensorWise scaling, a and b should be float8, scales should be float and singletons.\n"
+    "- For RowWise scaling, a and b should be float8, scales should be float, scale_a should be (", a.size(0), ", 1) and scale_b should be (1, ", b.size(1), "), and both should be contiguous.\n"
+    "- For BlockWise 1x128 scaling, a and b should be float8, scales should be float, scale_a should be (", a.size(0), ", ", ceil_div<int64_t>(a.size(1), 128), ") and scale_b should be (", ceil_div<int64_t>(b.size(0), 128), ", ", b.size(1), "), and both should be outer-dim-major.\n"
+    "- For MXFP8 Blockwise 1x32 scaling, a and b should be float8, scales should be float8_e8m0fnu, scale_a should have ", a.size(0) * ceil_div<int64_t>(a.size(1), 32), " elements and scale_b should have ", b.size(1) * ceil_div<int64_t>(b.size(0), 32), " elements.\n"
+    "- For MXFP4 Blockwise 1x32 scaling, a and b should be float4 (packed 2x), scales should be float8_e8m0fnu, scale_a should have ", a.size(0) * ceil_div<int64_t>(a.size(1) * 2, 32), " elements and scale_b should have ", b.size(1) * ceil_div<int64_t>(b.size(0) * 2, 32), " elements.\n"
+    "Got a.dtype()=", a.scalar_type(), ", scale_a.dtype()=", scale_a.scalar_type(), ", scale_a.size()=", scale_a.sizes(), ", scale_a.stride()=", scale_a.strides(), ", ",
+    "b.dtype()=", b.scalar_type(), ", scale_b.dtype()=", scale_b.scalar_type(), ", scale_b.size()=", scale_b.sizes(), " and scale_b.stride()=", scale_b.strides()
+  );
+}
+
+} // namespace
+
 namespace xpu {
 
 // result = beta * self + alpha * (mat1 * mat2)
@@ -355,6 +445,126 @@ TORCH_LIBRARY_IMPL(aten, XPU, m) {
   m.impl("tensordot.out", TORCH_FN(tensordot_out));
 }
 } // namespace xpu
+
+Tensor& _scaled_mm_out_xpu(
+    const Tensor& mat1,
+    const Tensor& mat2,
+    const Tensor& scale_a,
+    const Tensor& scale_b,
+    const std::optional<at::Tensor>& bias,
+    const std::optional<at::Tensor>& scale_result,
+    std::optional<c10::ScalarType> out_dtype,
+    bool use_fast_accum, //ignored
+    Tensor& out) {
+  // Check sizes
+  TORCH_CHECK(mat1.dim() == 2, "mat1 must be a matrix");
+  TORCH_CHECK(mat2.dim() == 2, "mat2 must be a matrix");
+  TORCH_CHECK(
+      mat1.sizes()[1] == mat2.sizes()[0], "mat1 and mat2 shapes cannot be multiplied (",
+      mat1.sizes()[0], "x", mat1.sizes()[1], " and ", mat2.sizes()[0], "x", mat2.sizes()[1], ")");
+
+  // Check what type of scaling we are doing based on inputs. This list is sorted
+  // by decreasing priority. We prefer "simpler" schemes as they are supported
+  // more broadly (more GPU archs) and because they are more
+  // efficient. This tends to matter only for small matmuls (e.g., 1x1x128).
+  auto [scaling_choice_a, scaling_choice_b] = get_joint_scaling(
+    {
+      std::make_pair(ScalingType::TensorWise, ScalingType::TensorWise),
+      std::make_pair(ScalingType::RowWise, ScalingType::RowWise),
+      // TODO std::make_pair(ScalingType::BlockWise128x128, ScalingType::BlockWise1x128),
+      // TODO std::make_pair(ScalingType::BlockWise1x128, ScalingType::BlockWise128x128),
+      std::make_pair(ScalingType::BlockWise1x128, ScalingType::BlockWise1x128),
+      std::make_pair(ScalingType::BlockWise1x32, ScalingType::BlockWise1x32),
+      // TODO std::make_pair(ScalingType::BlockWise1x16, ScalingType::BlockWise1x16)
+    },
+    mat1, mat2, scale_a, scale_b);
+
+  TORCH_CHECK(!scale_result || (scale_result->numel() == 1 && scale_result->scalar_type() == kFloat),
+       "scale_result must be a float scalar");
+  TORCH_CHECK(!bias || bias->numel() == mat2.sizes()[1], "Bias must be size ", mat2.sizes()[1],
+       " but got ", bias->numel());
+  TORCH_CHECK(
+      mat1.sizes()[1] % 16 == 0,
+      "Expected trailing dimension of mat1 to be divisible by 16 ",
+      "but got mat1 shape: (",
+      mat1.sizes()[0],
+      "x",
+      mat1.sizes()[1],
+      ").");
+  TORCH_CHECK(mat2.sizes()[0] % 16 == 0 && mat2.sizes()[1] % 16 == 0, "mat2 shape (", mat2.sizes()[0], "x",
+       mat2.sizes()[1], ") must be divisible by 16");
+  // Check types
+  TORCH_CHECK(!out_dtype || *out_dtype == out.scalar_type(), "out_dtype must match output matrix type");
+  TORCH_CHECK(isFloat8Type(mat1.scalar_type()) || mat1.scalar_type() == ScalarType::Float4_e2m1fn_x2,
+              "Expected mat1 to be Float8 or Float4_x2 matrix got ", mat1.scalar_type());
+  TORCH_CHECK(isFloat8Type(mat2.scalar_type()) || mat2.scalar_type() == ScalarType::Float4_e2m1fn_x2,
+              "Expected mat2 to be Float8 or Float4_x2 matrix got ", mat2.scalar_type());
+  TORCH_CHECK(!out_dtype || *out_dtype == out.scalar_type(), "out_dtype must match output matrix type");
+
+if (bias) {
+    TORCH_CHECK(out.scalar_type() != kFloat,
+        "Bias is not supported when out_dtype is set to Float32");
+
+    TORCH_CHECK(bias->scalar_type() == ScalarType::BFloat16 ||
+                bias->scalar_type() == ScalarType::Half,
+        "Bias must be BFloat16 or Half, but got ", bias->scalar_type());
+
+    TORCH_CHECK((out.scalar_type() != kFloat &&
+                 out.scalar_type() != ScalarType::BFloat16) ||
+                bias->scalar_type() == ScalarType::BFloat16,
+        "Bias must be BFloat16 to compute ", out.scalar_type(),
+        " output, but got ", bias->scalar_type());
+
+    TORCH_CHECK(out.scalar_type() != ScalarType::Half ||
+                bias->scalar_type() == ScalarType::Half,
+        "Bias must be Float16 to compute ", out.scalar_type(),
+        " output, but got ", bias->scalar_type());
+  }
+  {
+    auto bias_ = bias.value_or(Tensor());
+    auto scale_result_ = scale_result.value_or(Tensor());
+
+    // NOLINTNEXTLINE(*c-array*)
+    TensorArg targs[]{{out, "out", 0}, {mat1, "mat1", 1}, {mat2, "mat2", 2},
+                      {bias_, "bias", 3}, {scale_a, "scale_a", 4}, {scale_b, "scale_b", 5},
+                      {scale_result_, "scale_result", 6}};
+    checkAllSameGPU(__func__, targs);
+  }
+
+  // Validation checks have passed lets resize the output to actual size
+  IntArrayRef mat1_sizes = mat1.sizes();
+  IntArrayRef mat2_sizes = mat2.sizes();
+  at::native::resize_output(out, {mat1_sizes[0], mat2_sizes[1]});
+
+  // If any of M, K, N is 0 - return early (the tensorwise/rowwise float8 gemm
+  // kernels do not support this case).
+  if (mat1_sizes[0] == 0 || mat1_sizes[1] == 0 || mat2_sizes[1] == 0) {
+    // `out` was created with `at::empty`. In the case where we are multiplying
+    // MxK by KxN and K is the zero dim, we need to initialize here to properly
+    // return a tensor of zeros.
+    if (mat1_sizes[1] == 0) {
+      out.zero_();
+    }
+
+    return out;
+  }
+
+  onednn::scaled_matmul(mat1, mat2, out, scale_a, scale_b, scaling_choice_a, scaling_choice_b, bias, scale_result);
+
+  return out;
+}
+
+Tensor _scaled_mm_xpu(const Tensor& mat_a, const Tensor& mat_b,
+          const Tensor& scale_a,
+          const Tensor& scale_b,
+          const std::optional<at::Tensor>& bias,
+          const std::optional<at::Tensor>& scale_result,
+          std::optional<c10::ScalarType> out_dtype,
+          bool use_fast_accum) {
+  const auto out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
+  Tensor out = at::empty({0}, mat_a.options().dtype(out_dtype_));
+  return _scaled_mm_out_xpu(mat_a, mat_b, scale_a, scale_b, bias, scale_result, out_dtype, use_fast_accum, out);
+}
 
 TORCH_IMPL_FUNC(addmm_out_xpu)
 (const Tensor& self,
