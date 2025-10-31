@@ -369,13 +369,13 @@ struct ScaleSpec {
 inline ScaleSpec make_src_spec(ScalingType scaling_type, int64_t M, int64_t K) {
   switch (scaling_type) {
     case ScalingType::TensorWise:
-      return {0, {1,1}, dnnl::memory::data_type::f32};
+      return {0, {1, 1}, dnnl::memory::data_type::f32};
     case ScalingType::RowWise:
-      return {(1<<0), {1,K}, dnnl::memory::data_type::f32};
+      return {(1 << 0), {1, K}, dnnl::memory::data_type::f32};
     case ScalingType::BlockWise1x128:
-      return {(1<<0)|(1<<1), {1,128}, dnnl::memory::data_type::f32};
+      return {(1 << 0) | (1 << 1), {1, 128}, dnnl::memory::data_type::f32};
     case ScalingType::BlockWise1x32:
-      return {(1<<0)|(1<<1), {1,32}, dnnl::memory::data_type::e8m0};
+      return {(1 << 0) | (1 << 1), {1, 32}, dnnl::memory::data_type::e8m0};
   }
   TORCH_CHECK(false, "Unknown src scaling type");
 }
@@ -383,13 +383,13 @@ inline ScaleSpec make_src_spec(ScalingType scaling_type, int64_t M, int64_t K) {
 inline ScaleSpec make_wei_spec(ScalingType scaling_type, int64_t K, int64_t N) {
   switch (scaling_type) {
     case ScalingType::TensorWise:
-      return {0, {1,1}, dnnl::memory::data_type::f32};
+      return {0, {1, 1}, dnnl::memory::data_type::f32};
     case ScalingType::RowWise:
-      return {(1<<0)|(1<<1), {K,1}, dnnl::memory::data_type::f32};
+      return {(1 << 0), {K, 1}, dnnl::memory::data_type::f32};
     case ScalingType::BlockWise1x128:
-      return {(1<<0)|(1<<1), {128,1}, dnnl::memory::data_type::f32};
+      return {(1 << 0) | (1 << 1), {128, 1}, dnnl::memory::data_type::f32};
     case ScalingType::BlockWise1x32:
-      return {(1<<0)|(1<<1), {32,1}, dnnl::memory::data_type::e8m0};
+      return {(1 << 0) | (1 << 1), {32, 1}, dnnl::memory::data_type::e8m0};
   }
   TORCH_CHECK(false, "Unknown wei scaling type");
 }
