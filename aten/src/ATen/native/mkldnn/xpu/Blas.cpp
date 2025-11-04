@@ -32,39 +32,19 @@ bool is_rowwise_scaling(const at::Tensor& t, const at::Tensor& scale) {
 }
 
 // TODO: 1x16 blocks for packed nvfp4+ data and fp8_e5m3fn scales
-// bool is_blockwise_1x16_scaling(const at::Tensor& t, const at::Tensor& scale) {
-//   return (t.scalar_type() == ScalarType::Float4_e2m1fn_x2
-//       && scale.scalar_type() == at::kFloat8_e5m3fn
-//       && scale.numel() == t.size(0) * ceil_div<int64_t>(t.size(1) * 2, 16)
-//       && scale.is_contiguous());
-// }
-
-bool check_size_stride(const at::Tensor& scale, int dim, int size, int stride) {
-  // For Blockwise1x128 and Blockwise128x128,
-  // when the scale tensor has a dimension of size 1, the stride is effectively
-  // "meaningless", i.e. PyTorch decides to use a stride of 1. Thus, the regular
-  // stride check fails. Here, we relax the stride check when the effective
-  // stride is 1.
-
-  return (
-      scale.size(dim) == size && (size <= 1 || scale.stride(dim) == stride));
-}
 
 // 1x32 blocks for microscaled fp8/fp4 data and fp8_e8m0fnu scales
 bool is_blockwise_1x32_scaling(const at::Tensor& t, const at::Tensor& scale) {
   bool is_fp8_path = (isFloat8Type(t.scalar_type()) && scale.scalar_type() == at::kFloat8_e8m0fnu
-      && scale.numel() == t.size(0) * ceil_div<int64_t>(t.size(1), 32));
+      && scale.size(0) == t.size(0) && scale.size(1) == ceil_div<int64_t>(t.size(1), 32));
   bool is_packed_fp4_path = (t.scalar_type() == ScalarType::Float4_e2m1fn_x2 && scale.scalar_type() == at::kFloat8_e8m0fnu
-      && scale.numel() == t.size(0) * ceil_div<int64_t>(t.size(1) * 2, 32));
+      && scale.size(0) == t.size(0) && scale.size(1) == ceil_div<int64_t>(t.size(1) * 2, 32));
   return (is_fp8_path || is_packed_fp4_path);
 }
 
 bool is_blockwise_1x128_scaling(const at::Tensor& t, const at::Tensor& scale) {
-  return (
-      isFloat8Type(t.scalar_type()) && scale.scalar_type() == kFloat &&
-      scale.dim() == 2 && check_size_stride(scale, 0, t.size(0), 1) &&
-      check_size_stride(
-          scale, 1, ceil_div<int64_t>(t.size(1), 128), t.size(0)));
+  return (isFloat8Type(t.scalar_type()) && scale.scalar_type() == kFloat && scale.dim() == 2
+      && scale.size(0) == t.size(0) && scale.size(1) == ceil_div<int64_t>(t.size(1), 128));
 }
 
 bool is_desired_scaling(const at::Tensor& t, const at::Tensor& scale, ScalingType desired_scaling) {
@@ -97,10 +77,10 @@ std::pair<ScalingType, ScalingType> get_joint_scaling(
     false,
     "Invalid scaling configuration.\n"
     "- For TensorWise scaling, a and b should be float8, scales should be float and singletons.\n"
-    "- For RowWise scaling, a and b should be float8, scales should be float, scale_a should be (", a.size(0), ", 1) and scale_b should be (1, ", b.size(1), "), and both should be contiguous.\n"
-    "- For BlockWise 1x128 scaling, a and b should be float8, scales should be float, scale_a should be (", a.size(0), ", ", ceil_div<int64_t>(a.size(1), 128), ") and scale_b should be (", ceil_div<int64_t>(b.size(0), 128), ", ", b.size(1), "), and both should be outer-dim-major.\n"
-    "- For MXFP8 Blockwise 1x32 scaling, a and b should be float8, scales should be float8_e8m0fnu, scale_a should have ", a.size(0) * ceil_div<int64_t>(a.size(1), 32), " elements and scale_b should have ", b.size(1) * ceil_div<int64_t>(b.size(0), 32), " elements.\n"
-    "- For MXFP4 Blockwise 1x32 scaling, a and b should be float4 (packed 2x), scales should be float8_e8m0fnu, scale_a should have ", a.size(0) * ceil_div<int64_t>(a.size(1) * 2, 32), " elements and scale_b should have ", b.size(1) * ceil_div<int64_t>(b.size(0) * 2, 32), " elements.\n"
+    "- For RowWise scaling, a and b should be float8, scales should be float, scale_a should be (", a.size(0), ", 1) and scale_b should be (1, ", b.size(1), "), and both should be contiguous.\n" 
+    "- For BlockWise 1x128 scaling, a and b should be float8, scales should be float, scale_a should be (", a.size(0), ", ", ceil_div<int64_t>(a.size(1), 128), ") and scale_b should be (", ceil_div<int64_t>(b.size(0), 128), ", ", b.size(1), ").\n"
+    "- For MXFP8 Blockwise 1x32 scaling, a and b should be float8, scales should be float8_e8m0fnu, scale_a should be (", a.size(0), ", ", ceil_div<int64_t>(a.size(1), 32), ") and scale_b should be (", ceil_div<int64_t>(b.size(0), 32), ", ", b.size(1), "). \n"
+    "- For MXFP4 Blockwise 1x32 scaling, a and b should be float4 (packed 2x), scales should be float8_e8m0fnu, scale_a should be (", a.size(0), ", ", ceil_div<int64_t>(a.size(1) * 2, 32), ") and scale_b should be (", ceil_div<int64_t>(b.size(0) * 2, 32), ", ", b.size(1), "). \n"
     "Got a.dtype()=", a.scalar_type(), ", scale_a.dtype()=", scale_a.scalar_type(), ", scale_a.size()=", scale_a.sizes(), ", scale_a.stride()=", scale_a.strides(), ", ",
     "b.dtype()=", b.scalar_type(), ", scale_b.dtype()=", scale_b.scalar_type(), ", scale_b.size()=", scale_b.sizes(), " and scale_b.stride()=", scale_b.strides()
   );

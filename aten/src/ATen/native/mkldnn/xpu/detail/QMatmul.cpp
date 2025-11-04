@@ -371,7 +371,7 @@ inline ScaleSpec make_src_spec(ScalingType scaling_type, int64_t M, int64_t K) {
     case ScalingType::TensorWise:
       return {0, {1, 1}, dnnl::memory::data_type::f32};
     case ScalingType::RowWise:
-      return {(1 << 0), {1, K}, dnnl::memory::data_type::f32};
+      return {(1 << 0) | (1 << 1), {1, K}, dnnl::memory::data_type::f32};
     case ScalingType::BlockWise1x128:
       return {(1 << 0) | (1 << 1), {1, 128}, dnnl::memory::data_type::f32};
     case ScalingType::BlockWise1x32:
@@ -385,7 +385,7 @@ inline ScaleSpec make_wei_spec(ScalingType scaling_type, int64_t K, int64_t N) {
     case ScalingType::TensorWise:
       return {0, {1, 1}, dnnl::memory::data_type::f32};
     case ScalingType::RowWise:
-      return {(1 << 0), {K, 1}, dnnl::memory::data_type::f32};
+      return {(1 << 0) | (1 << 1), {K, 1}, dnnl::memory::data_type::f32};
     case ScalingType::BlockWise1x128:
       return {(1 << 0) | (1 << 1), {128, 1}, dnnl::memory::data_type::f32};
     case ScalingType::BlockWise1x32:
@@ -419,25 +419,9 @@ sycl::event scaled_matmul(
   at::Tensor b = is_onednn_matmul_strides(mat2) ? mat2 : mat2.contiguous();
   at::Tensor c = is_onednn_matmul_strides(result) ? result : result.contiguous();
 
-  dnnl::memory::desc a_md = [&] {
-    auto dt = get_onednn_dtype_include_double(a);
-    if (is_fp4) {
-      return dnnl::memory::desc({M, K}, dt, dnnl::memory::format_tag::ab);
-    } else {
-      return dnnl::memory::desc({M, K}, dt, {a.stride(0), a.stride(1)});
-    }
-  }();
-
-  dnnl::memory::desc b_md = [&] {
-    auto dt = get_onednn_dtype_include_double(b);
-    if (is_fp4) {
-      return dnnl::memory::desc({K, N}, dt, dnnl::memory::format_tag::ab);
-    } else {
-      return dnnl::memory::desc({K, N}, dt, {b.stride(0), b.stride(1)});
-    }
-  }();
-
-  dnnl::memory::desc c_md({M, N}, get_onednn_dtype_include_double(c), {c.stride(0), c.stride(1)});
+  dnnl::memory::desc a_md({M, K}, get_onednn_dtype_include_double(a), dnnl::memory::format_tag::ab);
+  dnnl::memory::desc b_md({K, N}, get_onednn_dtype_include_double(b), dnnl::memory::format_tag::ba);
+  dnnl::memory::desc c_md({M, N}, get_onednn_dtype_include_double(c), dnnl::memory::format_tag::ab);
 
   // Build per-role scale specs from scaling choice
   const ScaleSpec src_spec = make_src_spec(scaling_choice_a, M, K);

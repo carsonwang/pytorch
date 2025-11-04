@@ -1,5 +1,6 @@
 # Owner(s): ["module: intel"]
 
+import re
 import unittest
 from typing import Optional
 
@@ -29,7 +30,6 @@ f8_grouped_msg = "FP8 grouped is not supported on this device"
 # avoid division by zero when calculating scale
 EPS = 1e-12
 
-
 def amax_to_scale(
     amax: torch.Tensor, float8_dtype: torch.dtype, orig_dtype: torch.dtype
 ):
@@ -56,7 +56,6 @@ def amax_to_scale(
     scale.copy_(res)
     return scale
 
-
 def tensor_to_scale(x: torch.Tensor, float8_dtype: torch.dtype, dim=None):
     if dim is None:
         amax = torch.max(torch.abs(x))
@@ -64,7 +63,6 @@ def tensor_to_scale(x: torch.Tensor, float8_dtype: torch.dtype, dim=None):
         amax = torch.max(torch.abs(x), dim=dim, keepdim=True).values
 
     return amax_to_scale(amax, float8_dtype, x.dtype)
-
 
 def tensor_to_scale_block(
     x: torch.Tensor,
@@ -79,7 +77,6 @@ def tensor_to_scale_block(
     x = x.flatten(2, 3).flatten(0, 1)
     scale = scale.flatten(2, 3).flatten(0, 1)
     return x, scale
-
 
 def round_up(x: int, y: int) -> int:
     return ((x + y - 1) // y) * y
@@ -107,7 +104,6 @@ def scaled_mm_wrap(
         bias=bias,
         use_fast_accum=use_fast_accum,
     )
-
 
 def mm_float8_emulated(x, x_scale, y, y_scale, out_dtype) -> torch.Tensor:
     # naive implementation: dq -> op -> q
@@ -162,7 +158,6 @@ def addmm_float8_unwrapped(
     )
     return output
 
-
 def mm_float8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -175,7 +170,6 @@ def mm_float8(
         a, a_scale, b, b_scale, output_dtype, output_scale
     )
 
-
 def to_fp8_saturated(x: torch.Tensor, fp8_dtype: torch.dtype):
     if fp8_dtype == e4m3_type:
         x = x.clamp(min=-1 * E4M3_MAX_POS, max=E4M3_MAX_POS)
@@ -185,7 +179,6 @@ def to_fp8_saturated(x: torch.Tensor, fp8_dtype: torch.dtype):
         raise ValueError(f"to_fp8_saturated(): Unsupported fp8_dtype: {fp8_dtype}")
 
     return x.to(fp8_dtype)
-
 
 def compute_error(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Computes the error between two tensors in dB.
@@ -234,11 +227,9 @@ def data_to_mx_scale(x, block_size, recipe):
     scale_e8m0_biased = scale_e8m0_biased.view(torch.float8_e8m0fnu)
     return scale_e8m0_biased.reshape(orig_shape[0], -1)
 
-
 def down_size(size):
     assert size[-1] % 2 == 0, f"{size} last dim not divisible by two"
     return (*size[:-1], size[-1] // 2)
-
 
 def pack_uint4(uint8_data) -> torch.Tensor:
     # converting to uint8 for operations
@@ -454,6 +445,30 @@ class TestFP8Matmul(TestCase):
         )
 
     @onlyXPU
+    def test_float8_rowwise_scaling_sanity(self, device) -> None:
+        M, K, N = (1024, 512, 2048)
+        fill_value = 0.5
+        x = torch.full((M, K), fill_value, device=device)
+        y = torch.full((N, K), fill_value, device=device)
+
+        x_scales = torch.ones((x.shape[0], 1), device=device, dtype=torch.float32)
+        y_scales = torch.ones((1, y.shape[0]), device=device, dtype=torch.float32)
+
+        x_fp8 = x.to(e4m3_type)
+        y_fp8 = y.to(e4m3_type).t()
+
+        out_fp8 = scaled_mm_wrap(
+            x_fp8,
+            y_fp8,
+            scale_a=x_scales,
+            scale_b=y_scales,
+            out_dtype=torch.bfloat16,
+        )
+        self.assertEqual(
+            out_fp8.to(torch.float32), torch.full((M, N), K * (fill_value**2), device=device)
+        )
+
+    @onlyXPU
     @parametrize("output_dtype", [torch.bfloat16, torch.float32])
     @parametrize("lhs_block,rhs_block", [(1, 1)])
     @parametrize("M,N,K", [(128, 512, 256)])  # TODO: @parametrize("M,N,K", [(256, 768, 512)])
@@ -501,6 +516,182 @@ class TestFP8Matmul(TestCase):
         )
         self.assertGreaterEqual(float(cosine_sim), 0.999)
 
+    def test_pack_uint4(self):
+        """
+        Verify that given a tensor with high precision values [val0, val1],
+        the x2 packed representation is val1:val0 (from MSB to LSB), and
+        not val0:val1.
+
+        Note that the packing function is private to this file, but it's still
+        good to test that we are packing in the expected way.
+        """
+        hp_data = torch.tensor([0b00000010, 0b00001011], dtype=torch.uint8)
+        lp_data_actual = pack_uint4(hp_data)
+        lp_data_expected = torch.tensor([0b10110010], dtype=torch.uint8)
+        torch.testing.assert_close(lp_data_actual, lp_data_expected, atol=0, rtol=0)
+
+    @onlyXPU
+    @parametrize("base_dtype", [torch.bfloat16, torch.float32])
+    def test_scaled_mm_vs_emulated_row_wise(self, base_dtype):
+        torch.manual_seed(42)
+        input_dtype = e4m3_type
+        output_dtype = base_dtype
+
+        x = torch.randn(16, 16, device="xpu", dtype=base_dtype)
+        y = torch.randn(32, 16, device="xpu", dtype=base_dtype).t()
+
+        x_scales = tensor_to_scale(x, input_dtype, dim=1).float()
+        y_scales = tensor_to_scale(y, input_dtype, dim=0).float()
+
+        x_fp8 = to_fp8_saturated(x * x_scales, e4m3_type)
+        y_fp8 = to_fp8_saturated(y * y_scales, e4m3_type)
+
+        def test():
+            # Calculate actual F8 mm
+            out_scaled_mm = scaled_mm_wrap(
+                x_fp8,
+                y_fp8,
+                scale_a=x_scales.reciprocal(),
+                scale_b=y_scales.reciprocal(),
+                out_dtype=output_dtype
+            )
+
+            # Calculate emulated F8 mm
+            out_emulated = mm_float8_emulated(
+                x_fp8, x_scales, y_fp8, y_scales, output_dtype
+            )
+
+            if base_dtype in {torch.bfloat16, torch.float16}:
+                atol, rtol = 7e-2, 7e-2
+            else:
+                atol, rtol = 2e-3, 2e-3
+
+            self.assertEqual(out_scaled_mm, out_emulated, atol=atol, rtol=rtol)
+
+        test()
+
+    @onlyXPU
+    @parametrize("output_dtype", [torch.bfloat16, torch.float32])
+    @parametrize("lhs_block,rhs_block", [(1, 1)]) # TODO: (128, 1), (1, 128)
+    @parametrize("M,N,K", [(128, 512, 256)])  # TODO: (256, 768, 512)
+    def test_scaled_mm_vs_emulated_block_wise(self, output_dtype, lhs_block, rhs_block, M, N, K):
+        torch.manual_seed(42)
+
+        x = torch.randn(M, K, device="xpu", dtype=output_dtype).pow(3)
+        y = torch.randn(N, K, device="xpu", dtype=output_dtype).pow(3)
+
+        x_fp8, x_scales = tensor_to_scale_block(x, e4m3_type, lhs_block, 128)
+        y_fp8, y_scales = tensor_to_scale_block(y, e4m3_type, rhs_block, 128)
+
+        # 1x128 blocks need scales to be outer-dim-major
+        if lhs_block == 1:
+            x_scales = x_scales.t().contiguous().t()
+            lhs_recipe = ScalingType.BlockWise1x128
+        else:
+            lhs_recipe = ScalingType.BlockWise128x128
+        if rhs_block == 1:
+            y_scales = y_scales.t().contiguous().t()
+            rhs_recipe = ScalingType.BlockWise1x128
+        else:
+            rhs_recipe = ScalingType.BlockWise128x128
+
+
+        # Calculate actual F8 mm
+        out_scaled_mm = scaled_mm_wrap(
+            x_fp8, y_fp8.t(), scale_a=x_scales.reciprocal(), scale_b=y_scales.reciprocal().t(), out_dtype=output_dtype
+        )
+
+        # Calculate emulated F8 mm
+        out_emulated = mm_float8_emulated_block(
+            x_fp8, x_scales, y_fp8.t(), y_scales.t(), output_dtype
+        )
+
+        cosine_sim = torch.nn.functional.cosine_similarity(
+            out_scaled_mm.flatten().float(), out_emulated.flatten().float(), dim=0
+        )
+        self.assertGreaterEqual(float(cosine_sim), 0.999)
+
+        if output_dtype in {torch.bfloat16, torch.float16}:
+            atol, rtol = 6e-1, 7e-2
+        else:
+            atol, rtol = 7e-1, 2e-3
+
+        self.assertEqual(out_scaled_mm, out_emulated, atol=atol, rtol=rtol)
+
+        # One last check against the full-precision reference, to ensure we
+        # didn't mess up the scaling itself and made the test trivial.
+        cosine_sim = torch.nn.functional.cosine_similarity(
+            out_scaled_mm.flatten().float(), (x @ y.t()).flatten().float(), dim=0
+        )
+        self.assertGreaterEqual(float(cosine_sim), 0.999)
+
+    @onlyXPU
+    @parametrize("output_dtype", [torch.bfloat16, torch.float32])
+    @parametrize("lhs_block,rhs_block", [(1, 1)]) # TODO (128, 1), (1, 128)
+    @parametrize("M,N,K", [(256, 128, 256), (256, 256, 128)])
+    def test_scaled_mm_vs_emulated_block_wise_verify_small_shapes(
+        self, output_dtype, lhs_block, rhs_block, M, N, K
+    ):
+        torch.manual_seed(42)
+
+        x = torch.randn(M, K, device="xpu", dtype=output_dtype).pow(3)
+        y = torch.randn(N, K, device="xpu", dtype=output_dtype).pow(3)
+
+        x_fp8, x_scales = tensor_to_scale_block(x, e4m3_type, lhs_block, 128)
+        y_fp8, y_scales = tensor_to_scale_block(y, e4m3_type, rhs_block, 128)
+
+        # 1x128 blocks need scales to be outer-dim-major
+        if lhs_block == 1:
+            x_scales = x_scales.t().contiguous().t()
+            lhs_recipe = ScalingType.BlockWise1x128
+        else:
+            lhs_recipe = ScalingType.BlockWise128x128
+
+        if rhs_block == 1:
+            y_scales = y_scales.t().contiguous().t()
+            rhs_recipe = ScalingType.BlockWise1x128
+        else:
+            rhs_recipe = ScalingType.BlockWise128x128
+
+        # Verify that actual F8 mm doesn't error
+        scaled_mm_wrap(
+            x_fp8,
+            y_fp8.t(),
+            scale_a=x_scales,
+            scale_b=y_scales.t(),
+            out_dtype=output_dtype,
+        )
+
+        # Verify that emulated F8 mm doesn't error
+        mm_float8_emulated_block(x_fp8, x_scales, y_fp8.t(), y_scales.t(), output_dtype)
+
+    @onlyXPU
+    @parametrize("which_dim_zero", [0, 1, 2])
+    @parametrize("use_torch_compile", [False])
+    def test_zero_dim_tensorwise(self, which_dim_zero, use_torch_compile) -> None:
+        device = "xpu"
+        x_dtype, y_dtype = e4m3_type, e4m3_type
+        out_dtype = torch.bfloat16
+        M, K, N = 32, 32, 32
+        if which_dim_zero == 0:
+            M = 0
+        elif which_dim_zero == 1:
+            K = 0
+        elif which_dim_zero == 2:
+            N = 0
+
+        x_fp8 = torch.zeros(M, K, device=device).to(x_dtype)
+        y_fp8 = torch.zeros(N, K, device=device, dtype=y_dtype).t()
+        out_fp32 = torch.mm(x_fp8.to(torch.float), y_fp8.to(torch.float))
+        scale_a = torch.tensor(float('-inf'), device=device)
+        scale_b = torch.tensor(float('-inf'), device=device)
+        f = scaled_mm_wrap
+        if use_torch_compile:
+            f = torch.compile(scaled_mm_wrap)
+        out_fp8 = f(x_fp8, y_fp8, scale_a, scale_b, out_dtype=out_dtype)
+        self.assertEqual(out_dtype, out_fp8.dtype)
+        self.assertEqual(out_fp32, out_fp8.to(torch.float))
+
     # TODO: Some of the tests need to rely on MXFP8/MXFP4 ops. MXFP8 is tracked in https://github.com/intel/torch-xpu-ops/issues/2207
     @onlyXPU
     @parametrize("test_case_name", [
@@ -538,7 +729,7 @@ class TestFP8Matmul(TestCase):
         (127, 96, 1024),
         (1025, 128, 96)
     ], name_fn=lambda mkn: f"{mkn[0]}_{mkn[1]}_{mkn[2]}")
-    @parametrize("recipe", ["mxfp8"]) # // TODO: add , nvfp4+
+    @parametrize("recipe", ["mxfp8", "mxfp4"]) # // TODO: nvfp4+
     def test_blockwise_mxfp8_nvfp4_mxfp4_numerics(self, test_case_name, fast_accum, mkn, recipe) -> None:
         device = "xpu"
         M, K, N = mkn
@@ -640,11 +831,20 @@ class TestFP8Matmul(TestCase):
             else:  # nvfp4 # mxfp4
                 A = _bfloat16_to_float4_e2m1fn_x2(A_ref)
                 B = _bfloat16_to_float4_e2m1fn_x2(B_ref)
-                A_scale = torch.full((M, ceil_div(K, BLOCK_SIZE)), 1.0, device=device, dtype=fp4_scaling_dtype)
-                B_scale = torch.full((N, ceil_div(K, BLOCK_SIZE)), 1.0, device=device, dtype=fp4_scaling_dtype)
+                # A_scale = torch.full((M, ceil_div(K, BLOCK_SIZE)), 1.0, device=device, dtype=fp4_scaling_dtype)
+                # B_scale = torch.full((N, ceil_div(K, BLOCK_SIZE)), 1.0, device=device, dtype=fp4_scaling_dtype)
+                # A_ref[1][0:BLOCK_SIZE] = 4
+                # A.view(torch.uint8)[1][0:(BLOCK_SIZE // 2)] = 0b01000100
+                # A_scale[1][0] = 2
+
+                # Workaround before Float8_e8m0fnu copy is supported.
+                A_scale_u8 = torch.full((M, ceil_div(K, BLOCK_SIZE)), e8m0_pow2_byte(0), device=device, dtype=torch.uint8)
+                B_scale_u8 = torch.full((ceil_div(K, BLOCK_SIZE), N), e8m0_pow2_byte(0), device=device, dtype=torch.uint8)
                 A_ref[1][0:BLOCK_SIZE] = 4
                 A.view(torch.uint8)[1][0:(BLOCK_SIZE // 2)] = 0b01000100
-                A_scale[1][0] = 2
+                A_scale_u8[1, 0] = e8m0_pow2_byte(1)
+                A_scale = A_scale_u8.view(torch.float8_e8m0fnu)
+                B_scale = B_scale_u8.view(torch.float8_e8m0fnu)
 
         elif test_case_name == "a_ones_b_scale_modified":
             A_ref = torch.ones(M, K, device=device, dtype=torch.bfloat16)
@@ -670,11 +870,20 @@ class TestFP8Matmul(TestCase):
             else:  # nvfp4 # mxfp4
                 A = _bfloat16_to_float4_e2m1fn_x2(A_ref)
                 B = _bfloat16_to_float4_e2m1fn_x2(B_ref)
-                A_scale = torch.full((M, ceil_div(K, BLOCK_SIZE)), 1.0, device=device, dtype=fp4_scaling_dtype)
-                B_scale = torch.full((N, ceil_div(K, BLOCK_SIZE)), 1.0, device=device, dtype=fp4_scaling_dtype)
+                # A_scale = torch.full((M, ceil_div(K, BLOCK_SIZE)), 1.0, device=device, dtype=fp4_scaling_dtype)
+                # B_scale = torch.full((N, ceil_div(K, BLOCK_SIZE)), 1.0, device=device, dtype=fp4_scaling_dtype)
+                # B_ref[1][0:BLOCK_SIZE] = 4
+                # B.view(torch.uint8)[1][0:(BLOCK_SIZE // 2)] = 0b01000100
+                # B_scale[1][0] = 2
+
+                # Workaround before Float8_e8m0fnu copy is supported.
+                A_scale_u8 = torch.full((M, ceil_div(K, BLOCK_SIZE)), e8m0_pow2_byte(0), device=device, dtype=torch.uint8)
+                B_scale_u8 = torch.full((ceil_div(K, BLOCK_SIZE), N), e8m0_pow2_byte(0), device=device, dtype=torch.uint8)
                 B_ref[1][0:BLOCK_SIZE] = 4
                 B.view(torch.uint8)[1][0:(BLOCK_SIZE // 2)] = 0b01000100
-                B_scale[1][0] = 2
+                B_scale_u8[0][1] = e8m0_pow2_byte(1)
+                A_scale = A_scale_u8.view(torch.float8_e8m0fnu)
+                B_scale = B_scale_u8.view(torch.float8_e8m0fnu)
 
         elif test_case_name == "data_random_scales_one":
             require_exact_match = False
@@ -707,7 +916,7 @@ class TestFP8Matmul(TestCase):
                 A = _bfloat16_to_float4_e2m1fn_x2(A_ref)
                 B = _bfloat16_to_float4_e2m1fn_x2(B_ref)
                 A_scale = torch.full((M, ceil_div(K, BLOCK_SIZE)), 1.0, device=device, dtype=fp4_scaling_dtype)
-                B_scale = torch.full((N, ceil_div(K, BLOCK_SIZE)), 1.0, device=device, dtype=fp4_scaling_dtype)
+                B_scale = torch.full((ceil_div(K, BLOCK_SIZE), N), 1.0, device=device, dtype=fp4_scaling_dtype)
 
         elif test_case_name == "data_random_scales_from_data":
             if not K % BLOCK_SIZE == 0:
