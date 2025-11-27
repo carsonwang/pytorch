@@ -1,5 +1,6 @@
 #include <ATen/BlasBackend.h>
 #include <ATen/Tensor.h>
+#include <ATen/ceil_div.h>
 #include <ATen/core/Tensor.h>
 #include <c10/core/ScalarType.h>
 
@@ -354,24 +355,55 @@ struct ScaleSpec {
         arg_type,
         "'");
 
-    // For rowwise: SRC groups={1, K}, WEI groups={K, 1}
-    TORCH_INTERNAL_ASSERT(
-        (groups == dnnl::memory::dims{1, inner_dim} ||
-         groups == dnnl::memory::dims{inner_dim, 1}),
-        "The groups must be either {1, inner_dim} or {inner_dim, 1}. But got ",
-        groups,
-        ".");
-    return outer_dim;
+    TORCH_CHECK(
+        groups.size() == 2,
+        "expected_numel: groups must have two dims, got ",
+        groups.size());
+
+    const int64_t g0 = groups[0];
+    const int64_t g1 = groups[1];
+
+    if (arg_type == "src") {
+      // SRC uses pattern {1, g}
+      TORCH_CHECK(
+          g0 == 1,
+          "expected_numel(SRC): groups must be {1, g}, got {", g0, ", ", g1, "}");
+      TORCH_CHECK(
+          g1 >= 1,
+          "expected_numel(SRC): g must be >= 1, got ", g1);
+
+      if (g1 == inner_dim)
+        return outer_dim;
+      return outer_dim * ceil_div(inner_dim, g1);
+    } else {
+      // WEIGHTS uses pattern {g, 1}
+      TORCH_CHECK(
+          g1 == 1,
+          "expected_numel(WEI): groups must be {g, 1}, got {", g0, ", ", g1, "}");
+      TORCH_CHECK(
+          g0 >= 1,
+          "expected_numel(WEI): g must be >= 1, got ", g0);
+
+      if (g0 == inner_dim)
+        return outer_dim;
+      return ceil_div(inner_dim, g0) * outer_dim;
+    }
   }
 
   // Normalize an incoming scale tensor to contiguous storage and appropriate
   // dtype/view
   at::Tensor normalize(const at::Tensor& scale) const {
-    TORCH_INTERNAL_ASSERT(
-        dtype == dnnl::memory::data_type::f32,
-        "tensor scale currently must be f32, but got scale dtype: ",
-        scale.scalar_type());
-    return scale.to(at::kFloat).contiguous();
+    if (dtype == dnnl::memory::data_type::f32) {
+      return scale.to(at::kFloat).contiguous();
+    }
+    // TORCH_CHECK(
+    //     dtype == dnnl::memory::data_type::e8m0 || dtype == dnnl::memory::data_type::f8_e5m3,
+    //     "Unsupported scale dtype in ScaleSpec::normalize");
+    if (scale.scalar_type() == at::kByte) {
+      return scale.contiguous();
+    } else {
+      return scale.contiguous().view(at::kByte);
+    }
   }
 };
 
@@ -390,26 +422,34 @@ inline ScaleSpec make_scale_spec(
       "Expected arg_type to be 'src' or 'wei', but got '",
       arg_type,
       "'");
-  TORCH_INTERNAL_ASSERT(
-      (scaling_type == at::blas::ScalingType::TensorWise ||
-       scaling_type == at::blas::ScalingType::RowWise),
-      "Currently only support scaling_type for TensorWise or RowWise");
-  int64_t dim = K; // Currently only K is used for grouping
   bool is_src = (arg_type == "src");
-  if (scaling_type == at::blas::ScalingType::TensorWise) {
-    // Scale tensorwise. The same as `--attr-scales=common`.
-    // mask=0 : scale whole tensor
-    // groups={1, 1}: indicates that there is only one group for scaling
-    return {0, {1, 1}, dnnl::memory::data_type::f32};
-  } else {
-    // (scaling_type == at::blas::ScalingType::RowWise)
-    // Scale RowWise. The same as `--attr-scales=per_dim_01`.
-    // mask={(1 << 0) | (1 << 1)}: Scale on both dim0 and dim1
-    // SRC: groups={1, K}, WEIGHTS: groups={K, 1}
-    return {
+
+  switch (scaling_type) {
+    case at::blas::ScalingType::TensorWise:
+      // Scale tensorwise. The same as `--attr-scales=common`.
+      // mask=0 : scale whole tensor
+      // groups={1, 1}: indicates that there is only one group for scaling
+      return {0, {1, 1}, dnnl::memory::data_type::f32};
+    case at::blas::ScalingType::RowWise:
+      // Scale RowWise. The same as `--attr-scales=per_dim_01`.
+      // mask={(1 << 0) | (1 << 1)}: Scale on both dim0 and dim1
+      // SRC: groups={1, K}, WEIGHTS: groups={K, 1}
+      return {
         (1 << 0) | (1 << 1),
-        is_src ? dnnl::memory::dims{1, dim} : dnnl::memory::dims{dim, 1},
+        is_src ? dnnl::memory::dims{1, K} : dnnl::memory::dims{K, 1},
         dnnl::memory::data_type::f32};
+    case at::blas::ScalingType::BlockWise1x128:
+      return {
+        (1 << 0) | (1 << 1),
+        is_src ? dnnl::memory::dims{1, 128} : dnnl::memory::dims{128, 1},
+        dnnl::memory::data_type::f32};
+    case at::blas::ScalingType::BlockWise1x32:
+      return {
+        (1 << 0) | (1 << 1),
+        is_src ? dnnl::memory::dims{1, 32} : dnnl::memory::dims{32, 1},
+        dnnl::memory::data_type::e8m0};
+    default:
+      TORCH_CHECK(false, "Unknown scaling_type: ", static_cast<int>(scaling_type));
   }
 }
 
@@ -433,18 +473,14 @@ sycl::event scaled_matmul(
   // 3. execute
 
   const int64_t M = mat1.size(0);
-  const int64_t K = mat1.size(1);
+  bool is_fp4 = (mat1.scalar_type() == at::ScalarType::Float4_e2m1fn_x2);
+  const int64_t K = is_fp4 ? mat1.size(1) * 2 : mat1.size(1);
   const int64_t N = mat2.size(1);
 
   // 1.1 Create memory descriptor
-  dnnl::memory::desc src_md = get_onednn_md(mat1);
-  dnnl::memory::desc weights_md = get_onednn_md(mat2);
-  dnnl::memory::desc dst_md = get_onednn_md(result);
-
-  // scale_a and scale_b has already be checked in `is_desired_scaling()` call.
-  // So we could directly get their memory desc and set later.
-  dnnl::memory::desc scale_a_md = get_onednn_md(scale_a);
-  dnnl::memory::desc scale_b_md = get_onednn_md(scale_b);
+  dnnl::memory::desc src_md({M, K}, get_onednn_dtype_include_double(mat1), dnnl::memory::format_tag::ab);
+  dnnl::memory::desc weights_md({K, N}, get_onednn_dtype_include_double(mat2), dnnl::memory::format_tag::ba);
+  dnnl::memory::desc dst_md({M, N}, get_onednn_dtype_include_double(result), dnnl::memory::format_tag::ab);
 
   dnnl::memory::desc bias_md;
   bool with_bias = bias.has_value();

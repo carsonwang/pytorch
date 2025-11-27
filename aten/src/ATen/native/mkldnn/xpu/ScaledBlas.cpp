@@ -72,14 +72,39 @@ bool is_rowwise_scaling(const at::Tensor& t, const at::Tensor& scale) {
       scale.is_contiguous());
 }
 
+// TODO: 1x16 blocks for packed nvfp4+ data and fp8_e5m3fn scales
+
+// 1x32 blocks for microscaled fp8/fp4 data and fp8_e8m0fnu scales
+bool is_blockwise_1x32_scaling(const at::Tensor& t, const at::Tensor& scale) {
+  bool is_fp8_path = (isFloat8Type(t.scalar_type()) && scale.scalar_type() == at::kFloat8_e8m0fnu
+      && scale.size(0) == t.size(0) && scale.size(1) == ceil_div<int64_t>(t.size(1), 32));
+  bool is_packed_fp4_path = (t.scalar_type() == c10::ScalarType::Float4_e2m1fn_x2 && scale.scalar_type() == at::kFloat8_e8m0fnu
+      && scale.size(0) == t.size(0) && scale.size(1) == ceil_div<int64_t>(t.size(1) * 2, 32));
+  return (is_fp8_path || is_packed_fp4_path);
+}
+
+bool is_blockwise_1x128_scaling(const at::Tensor& t, const at::Tensor& scale) {
+  return (isFloat8Type(t.scalar_type()) && scale.scalar_type() == kFloat && scale.dim() == 2
+      && scale.size(0) == t.size(0) && scale.size(1) == ceil_div<int64_t>(t.size(1), 128));
+}
+
 bool is_desired_scaling(
     const at::Tensor& t,
     const at::Tensor& scale,
     ScalingType desired_scaling) {
-  auto result = desired_scaling == ScalingType::TensorWise
-      ? is_tensorwise_scaling(t, scale)
-      : is_rowwise_scaling(t, scale);
-  return result;
+  switch (desired_scaling) {
+    case ScalingType::TensorWise:
+      return is_tensorwise_scaling(t, scale);
+    case ScalingType::RowWise:
+      return is_rowwise_scaling(t, scale);
+    case ScalingType::BlockWise1x32:
+      return is_blockwise_1x32_scaling(t, scale);
+    case ScalingType::BlockWise1x128:
+      return is_blockwise_1x128_scaling(t, scale);
+    default:
+      TORCH_CHECK(false);
+      return false;
+  }
 }
 
 std::pair<ScalingType, ScalingType> get_joint_scaling(
@@ -95,31 +120,16 @@ std::pair<ScalingType, ScalingType> get_joint_scaling(
     }
   }
   TORCH_CHECK(
-      false,
-      "Invalid scaling configuration.\n"
-      "- For TensorWise scaling, a and b should be float8, scales should be float and singletons.\n"
-      "- For RowWise scaling, a and b should be float8, scales should be float, scale_a should be (",
-      a.size(0),
-      ", 1) and scale_b should be (1, ",
-      b.size(1),
-      "), and both should be contiguous.\n"
-      "Got a.dtype()=",
-      a.scalar_type(),
-      ", scale_a.dtype()=",
-      scale_a.scalar_type(),
-      ", scale_a.size()=",
-      scale_a.sizes(),
-      ", scale_a.stride()=",
-      scale_a.strides(),
-      ", ",
-      "b.dtype()=",
-      b.scalar_type(),
-      ", scale_b.dtype()=",
-      scale_b.scalar_type(),
-      ", scale_b.size()=",
-      scale_b.sizes(),
-      " and scale_b.stride()=",
-      scale_b.strides());
+    false,
+    "Invalid scaling configuration.\n"
+    "- For TensorWise scaling, a and b should be float8, scales should be float and singletons.\n"
+    "- For RowWise scaling, a and b should be float8, scales should be float, scale_a should be (", a.size(0), ", 1) and scale_b should be (1, ", b.size(1), "), and both should be contiguous.\n" 
+    "- For BlockWise 1x128 scaling, a and b should be float8, scales should be float, scale_a should be (", a.size(0), ", ", ceil_div<int64_t>(a.size(1), 128), ") and scale_b should be (", ceil_div<int64_t>(b.size(0), 128), ", ", b.size(1), ").\n"
+    "- For MXFP8 Blockwise 1x32 scaling, a and b should be float8, scales should be float8_e8m0fnu, scale_a should be (", a.size(0), ", ", ceil_div<int64_t>(a.size(1), 32), ") and scale_b should be (", ceil_div<int64_t>(b.size(0), 32), ", ", b.size(1), "). \n"
+    "- For MXFP4 Blockwise 1x32 scaling, a and b should be float4 (packed 2x), scales should be float8_e8m0fnu, scale_a should be (", a.size(0), ", ", ceil_div<int64_t>(a.size(1) * 2, 32), ") and scale_b should be (", ceil_div<int64_t>(b.size(0) * 2, 32), ", ", b.size(1), "). \n"
+    "Got a.dtype()=", a.scalar_type(), ", scale_a.dtype()=", scale_a.scalar_type(), ", scale_a.size()=", scale_a.sizes(), ", scale_a.stride()=", scale_a.strides(), ", ",
+    "b.dtype()=", b.scalar_type(), ", scale_b.dtype()=", scale_b.scalar_type(), ", scale_b.size()=", scale_b.sizes(), " and scale_b.stride()=", scale_b.strides()
+  );
 }
 
 Tensor& _scaled_gemm(
@@ -216,6 +226,9 @@ Tensor& _scaled_mm_out_xpu(
       {
           std::make_pair(ScalingType::TensorWise, ScalingType::TensorWise),
           std::make_pair(ScalingType::RowWise, ScalingType::RowWise),
+          std::make_pair(ScalingType::BlockWise1x128, ScalingType::BlockWise1x128),
+          std::make_pair(ScalingType::BlockWise1x32, ScalingType::BlockWise1x32),
+          // TODO std::make_pair(ScalingType::BlockWise1x16, ScalingType::BlockWise1x16)
       },
       mat1,
       mat2,
@@ -251,12 +264,12 @@ Tensor& _scaled_mm_out_xpu(
       !out_dtype || *out_dtype == out.scalar_type(),
       "out_dtype must match output matrix type");
   TORCH_CHECK(
-      at::isFloat8Type(mat1.scalar_type()),
-      "Expected mat1 to be Float8 matrix got ",
+      at::isFloat8Type(mat1.scalar_type()) || mat1.scalar_type() == c10::ScalarType::Float4_e2m1fn_x2,
+      "Expected mat1 to be Float8 or Float4_x2 matrix got ",
       mat1.scalar_type());
   TORCH_CHECK(
-      at::isFloat8Type(mat2.scalar_type()),
-      "Expected mat2 to be Float8 matrix got ",
+      at::isFloat8Type(mat2.scalar_type()) || mat2.scalar_type() == c10::ScalarType::Float4_e2m1fn_x2,
+      "Expected mat2 to be Float8 or Float4_x2 matrix got ",
       mat2.scalar_type());
   // TODO: oneDNN Currently only supports e4m3 with group scales on BMG. Not
   // support 2D scales, only 1D. Needs to add more checks there.
